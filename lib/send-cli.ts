@@ -119,27 +119,53 @@ function sendLog(message: string) {
 	console.log("Logged to memory/send-log.jsonl");
 }
 
+// --- Audit log ---
+
+function auditLog(transport: string, to: string, status: "ok" | "error", error?: string) {
+	const logDir = join(instanceDir, "state");
+	if (!existsSync(logDir)) mkdirSync(logDir, { recursive: true });
+	appendFileSync(
+		join(logDir, "send-audit.jsonl"),
+		`${JSON.stringify({
+			ts: new Date().toISOString(),
+			transport,
+			to: to || undefined,
+			subject: values.subject || undefined,
+			status,
+			error: error || undefined,
+			len: text.length,
+		})}\n`,
+	);
+}
+
 // --- Dispatch ---
 
 const transport = values.transport as string;
 const to = values.to ?? "";
 
-switch (transport) {
-	case "telegram":
-		await sendTelegram(to, text);
-		break;
-	case "gmail":
-		if (!to) {
-			console.error("--to required for gmail transport.");
+try {
+	switch (transport) {
+		case "telegram":
+			await sendTelegram(to, text);
+			break;
+		case "gmail":
+			if (!to) {
+				console.error("--to required for gmail transport.");
+				process.exit(1);
+			}
+			await sendGmail(to, text);
+			break;
+		case "log":
+			sendLog(text);
+			break;
+		default:
+			console.error(`Unknown transport: ${transport}`);
+			console.error("Available: telegram, gmail, log");
 			process.exit(1);
-		}
-		await sendGmail(to, text);
-		break;
-	case "log":
-		sendLog(text);
-		break;
-	default:
-		console.error(`Unknown transport: ${transport}`);
-		console.error("Available: telegram, gmail, log");
-		process.exit(1);
+	}
+	auditLog(transport, to, "ok");
+} catch (err: unknown) {
+	const msg = err instanceof Error ? err.message : String(err);
+	auditLog(transport, to, "error", msg);
+	throw err;
 }
