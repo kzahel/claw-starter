@@ -25,7 +25,7 @@ import {
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import cronParser from "cron-parser";
-import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { parse as parseYaml } from "yaml";
 import {
 	type PermissionRules,
 	type SessionExecutor,
@@ -36,13 +36,14 @@ import { loadEnv } from "./utils.js";
 
 // --- Types ---
 
-interface ScheduleState {
+interface ScheduleRunState {
 	lastRunAt?: string;
 	lastStatus?: "ok" | "error" | "skipped";
-	lastSummary?: string;
 	consecutiveErrors: number;
-	maxConsecutiveErrors: number;
 }
+
+/** Runtime state for all schedules, keyed by schedule name. Stored in state/scheduler.json. */
+type SchedulerState = Record<string, ScheduleRunState>;
 
 interface SkillRef {
 	skill: string;
@@ -56,7 +57,7 @@ interface Schedule {
 	output?: string | string[];
 	prompt?: string;
 	enabled?: boolean;
-	_state?: ScheduleState;
+	maxConsecutiveErrors?: number;
 }
 
 interface Config {
@@ -110,8 +111,20 @@ function loadConfig(): Config {
 	return parseYaml(raw) as Config;
 }
 
-function saveConfig(config: Config) {
-	writeFileSync(join(instanceDir, "config.yaml"), stringifyYaml(config));
+const stateFile = join(instanceDir, "state", "scheduler.json");
+
+function loadState(): SchedulerState {
+	try {
+		return JSON.parse(readFileSync(stateFile, "utf-8")) as SchedulerState;
+	} catch {
+		return {};
+	}
+}
+
+function saveState(state: SchedulerState) {
+	const dir = join(instanceDir, "state");
+	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+	writeFileSync(stateFile, JSON.stringify(state, null, 2) + "\n");
 }
 
 function appendActivity(entry: Record<string, unknown>) {
@@ -254,28 +267,24 @@ async function pollSession(
 }
 
 function updateState(
-	config: Config,
 	scheduleName: string,
 	status: "ok" | "error",
 	durationMs: number,
 ) {
-	const schedule = config.schedules?.find((s) => s.name === scheduleName);
-	if (!schedule) return;
+	const state = loadState();
+	const run = state[scheduleName] ?? { consecutiveErrors: 0 };
 
-	if (!schedule._state) {
-		schedule._state = { consecutiveErrors: 0, maxConsecutiveErrors: 5 };
-	}
-
-	schedule._state.lastRunAt = new Date().toISOString();
-	schedule._state.lastStatus = status;
+	run.lastRunAt = new Date().toISOString();
+	run.lastStatus = status;
 
 	if (status === "error") {
-		schedule._state.consecutiveErrors++;
+		run.consecutiveErrors++;
 	} else {
-		schedule._state.consecutiveErrors = 0;
+		run.consecutiveErrors = 0;
 	}
 
-	saveConfig(config);
+	state[scheduleName] = run;
+	saveState(state);
 
 	appendActivity({
 		ts: new Date().toISOString(),
@@ -370,9 +379,9 @@ function initTrackers(schedules: Schedule[]): ScheduleTracker[] {
 }
 
 function isAutoDisabled(schedule: Schedule): boolean {
-	const state = schedule._state;
+	const state = loadState()[schedule.name];
 	if (!state) return false;
-	const max = state.maxConsecutiveErrors ?? 5;
+	const max = schedule.maxConsecutiveErrors ?? 5;
 	return state.consecutiveErrors >= max;
 }
 
@@ -417,7 +426,7 @@ async function runLoop() {
 				const success = await fireSchedule(schedule, config);
 
 				if (!success) {
-					updateState(config, schedule.name, "error", 0);
+					updateState(schedule.name, "error", 0);
 				}
 
 				tracker.advance();
@@ -435,8 +444,7 @@ async function runLoop() {
 				const durationMs = Date.now() - active.startedAt;
 				log(`Session completed: ${name} (${Math.round(durationMs / 1000)}s)`);
 				executor.cleanup(active.sessionId);
-				config = loadConfig();
-				updateState(config, name, "ok", durationMs);
+				updateState(name, "ok", durationMs);
 				activeSessions.delete(name);
 			} else if (result === "error") {
 				const durationMs = Date.now() - active.startedAt;
@@ -444,8 +452,7 @@ async function runLoop() {
 				if (durationMs > 60_000) {
 					log(`Session error/lost: ${name}`);
 					executor.cleanup(active.sessionId);
-					config = loadConfig();
-					updateState(config, name, "error", durationMs);
+					updateState(name, "error", durationMs);
 					activeSessions.delete(name);
 				}
 			}
@@ -496,7 +503,7 @@ async function runNow(scheduleName: string) {
 	const success = await fireSchedule(schedule, config);
 
 	if (!success) {
-		updateState(config, scheduleName, "error", 0);
+		updateState(scheduleName, "error", 0);
 		process.exit(1);
 	}
 
@@ -514,16 +521,14 @@ async function runNow(scheduleName: string) {
 			const durationMs = Date.now() - active.startedAt;
 			log(`Done (${Math.round(durationMs / 1000)}s)`);
 			executor.cleanup(active.sessionId);
-			const freshConfig = loadConfig();
-			updateState(freshConfig, scheduleName, "ok", durationMs);
+			updateState(scheduleName, "ok", durationMs);
 			clearInterval(pollInterval);
 		} else if (result === "error") {
 			const durationMs = Date.now() - active.startedAt;
 			if (durationMs > 60_000) {
 				log("Session lost");
 				executor.cleanup(active.sessionId);
-				const freshConfig = loadConfig();
-				updateState(freshConfig, scheduleName, "error", durationMs);
+				updateState(scheduleName, "error", durationMs);
 				clearInterval(pollInterval);
 				process.exit(1);
 			}
